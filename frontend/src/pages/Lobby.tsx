@@ -28,45 +28,49 @@ const Lobby = () => {
   useEffect(() => {
     const uid = localStorage.getItem('auction_user_id');
     const adminStr = localStorage.getItem('auction_is_admin');
-    if (!uid) {
-      navigate('/');
-      return;
-    }
+    if (!uid) { navigate('/'); return; }
     setUserId(uid);
     setIsAdmin(adminStr === 'true');
-
     loadRoomAndParticipants();
+  }, [roomId]);
 
-    // Subscribe to realtime changes
-    const roomChannel = supabase.channel(`room_${roomId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'users', filter: `room_id=eq.${room?.id}` }, () => {
+  // Set up realtime subscriptions ONLY after room is loaded (room.id is known)
+  useEffect(() => {
+    if (!room?.id) return;
+
+    const ch = supabase.channel(`lobby_${roomId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users', filter: `room_id=eq.${room.id}` }, () => {
         loadRoomAndParticipants();
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `room_id=eq.${room?.id}` }, () => {
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `room_id=eq.${room.id}` }, () => {
         loadRoomAndParticipants();
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `room_code=eq.${roomId}` }, payload => {
-        if (payload.new.status === 'AUCTION') {
+        const updated = payload.new as any;
+        if (updated.status === 'AUCTION') {
           navigate(`/room/${roomId}/auction`);
         }
       })
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(roomChannel);
-    };
-  }, [roomId]);
+    return () => { supabase.removeChannel(ch); };
+  }, [room?.id, roomId]);
 
   const loadRoomAndParticipants = async () => {
     try {
       const { data: rm } = await supabase.from('rooms').select('*').eq('room_code', roomId).single();
       if (!rm) return;
       setRoom(rm);
-      
+
+      // If status already AUCTION, go there
+      if (rm.status === 'AUCTION') {
+        navigate(`/room/${roomId}/auction`);
+        return;
+      }
+
       const { data: users } = await supabase.from('users').select('*').eq('room_id', rm.id);
       const { data: teams } = await supabase.from('teams').select('*').eq('room_id', rm.id);
-      
-      // Combine user and team data
+
       const combined = users?.map(u => {
         const t = teams?.find(team => team.user_id === u.id);
         if (u.id === localStorage.getItem('auction_user_id') && t) {
@@ -74,10 +78,9 @@ const Lobby = () => {
         }
         return { ...u, team: t };
       }) || [];
-      
+
       setParticipants(combined);
 
-      // if admin flag locally isn't set right, check DB
       if (rm.admin_id === localStorage.getItem('auction_user_id')) {
         setIsAdmin(true);
       }
@@ -87,15 +90,21 @@ const Lobby = () => {
   };
 
   const selectTeam = async (teamId: string) => {
-    if (!room || !userId) return;
-    
-    // check if taken
-    const isTaken = participants.some(p => p.team?.team_name === teamId);
-    if (isTaken) return alert('Team is already taken by someone else!');
+    if (!room || !userId) {
+      alert('Room not loaded yet, please wait a moment and try again.');
+      return;
+    }
+
+    // check if taken by someone else
+    const isTaken = participants.some(p => p.team?.team_name === teamId && p.id !== userId);
+    if (isTaken) { alert('Team is already taken!'); return; }
 
     try {
-      // Upsert team selection
-      const { data: existingTeam } = await supabase.from('teams').select('*').eq('user_id', userId).eq('room_id', room.id).single();
+      const { data: existingTeam } = await supabase
+        .from('teams').select('*')
+        .eq('user_id', userId).eq('room_id', room.id)
+        .single();
+
       if (existingTeam) {
         await supabase.from('teams').update({ team_name: teamId }).eq('id', existingTeam.id);
       } else {
@@ -103,7 +112,7 @@ const Lobby = () => {
           room_id: room.id,
           user_id: userId,
           team_name: teamId,
-          purse: 1000000000 // 100 Cr
+          purse: 1000000000
         }]);
       }
       setSelectedTeam(teamId);
@@ -117,11 +126,14 @@ const Lobby = () => {
     if (!room) return;
     try {
       await supabase.from('rooms').update({ status: 'AUCTION' }).eq('id', room.id);
-      // Room channel sub will navigate everyone
+      // Navigate admin immediately; others navigate via realtime subscription
+      navigate(`/room/${roomId}/auction`);
     } catch (err) {
       console.error(err);
     }
   };
+
+  const allHaveTeams = participants.length > 0 && participants.every(p => !!p.team);
 
   return (
     <div className="container flex-col" style={{ gap: '30px' }}>
@@ -131,20 +143,20 @@ const Lobby = () => {
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(300px, 1fr) 2fr', gap: '30px' }}>
-        
+
         {/* Participants Left Col */}
         <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <Users size={24} color="var(--accent-blue)" />
             <h3>Participants ({participants.length})</h3>
           </div>
-          
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
             {participants.map(p => (
               <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '15px', background: 'rgba(255,255,255,0.05)', borderRadius: '12px' }}>
                 <span style={{ fontWeight: '500' }}>{p.name} {p.id === userId && '(You)'}</span>
                 {p.team ? (
-                  <span className="player-tag" style={{ background: IPL_TEAMS.find(t=>t.id===p.team.team_name)?.color || 'rgba(255,255,255,0.1)' }}>
+                  <span className="player-tag" style={{ background: IPL_TEAMS.find(t => t.id === p.team.team_name)?.color || 'rgba(255,255,255,0.1)' }}>
                     {p.team.team_name}
                   </span>
                 ) : (
@@ -155,17 +167,21 @@ const Lobby = () => {
           </div>
 
           {isAdmin && (
-            <button 
-              className="btn-primary" 
-              style={{ marginTop: 'auto', display: 'flex', justifyContent: 'center', gap: '10px' }}
-              onClick={startAuction}
-              disabled={participants.some(p => !p.team)} // Must all pick teams
-            >
-              Start Auction <Play size={20} />
-            </button>
-          )}
-          {isAdmin && participants.some(p => !p.team) && (
-            <p style={{ fontSize: '0.8rem', color: '#ffbe0b', textAlign: 'center' }}>Waiting for all players to select a team.</p>
+            <>
+              <button
+                className="btn-primary"
+                style={{ marginTop: 'auto', display: 'flex', justifyContent: 'center', gap: '10px' }}
+                onClick={startAuction}
+                disabled={!allHaveTeams}
+              >
+                Start Auction <Play size={20} />
+              </button>
+              {!allHaveTeams && (
+                <p style={{ fontSize: '0.8rem', color: '#ffbe0b', textAlign: 'center' }}>
+                  {selectedTeam ? 'Waiting for all players to select a team.' : '⬅️ Select your team first!'}
+                </p>
+              )}
+            </>
           )}
         </div>
 
@@ -175,12 +191,12 @@ const Lobby = () => {
             <Shield size={24} color="var(--accent-pink)" />
             <h3>Select Your Team</h3>
           </div>
-          
+
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: '15px' }}>
             {IPL_TEAMS.map(team => {
               const isTaken = participants.some(p => p.team?.team_name === team.id && p.id !== userId);
               const isMine = selectedTeam === team.id;
-              
+
               return (
                 <button
                   key={team.id}
