@@ -157,7 +157,9 @@ const Auction = () => {
       }
 
       // 3. Single channel for BOTH send and receive
-      channelRef.current = supabase.channel(`room_${roomId}_v2`);
+      channelRef.current = supabase.channel(`room_${roomId}_v2`, {
+        config: { broadcast: { ack: true } },
+      });
 
       channelRef.current
         .on('broadcast', { event: 'timer_tick' }, (p: any) => {
@@ -309,7 +311,14 @@ const Auction = () => {
         {myTeam && (
           <div style={{ display: 'flex', gap: '20px', alignItems: 'center', background: 'rgba(255,255,255,0.05)', padding: '10px 20px', borderRadius: '12px' }}>
             <div className="flex-col"><span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Your Team</span><strong style={{ color: 'var(--accent-gold)' }}>{myTeam.team_name}</strong></div>
-            <div className="flex-col" style={{ borderLeft: '1px solid var(--glass-border)', paddingLeft: '20px' }}><span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Purse Left</span><strong>₹ {toCr(myTeam.purse)} Cr</strong></div>
+            <div className="flex-col" style={{ borderLeft: '1px solid var(--glass-border)', paddingLeft: '20px' }}>
+              <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Purse Left</span>
+              <strong>₹ {toCr(myTeam.purse)} Cr</strong>
+            </div>
+            <div className="flex-col" style={{ borderLeft: '1px solid var(--glass-border)', paddingLeft: '20px' }}>
+              <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Squad</span>
+              <strong>{squads.filter(s => s.team_id === myTeam.id).length} / 25</strong>
+            </div>
           </div>
         )}
         {!myTeam && <div style={{ color: '#ff4d4d', fontSize: '0.9rem' }}>⚠️ No team assigned — go back to lobby</div>}
