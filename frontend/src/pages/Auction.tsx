@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -6,7 +6,17 @@ import { Timer, Gavel, User, ChevronRight, Pause, Play, Square } from 'lucide-re
 import playersData from '../data/players.json';
 
 const TIMER_DURATION = 15; // seconds per player
-const INCREMENT_LAKH = 10; // 10 Lakh per bid (0.1 Cr)
+const BID_TIME_BONUS = 3;  // seconds added per new bid
+const INCREMENT_LAKH = 10; // 10 Lakh per bid increment
+
+// All monetary values in the DB are stored in RUPEES.
+// base_price in players.json is in LAKHS.
+// 1 Lakh = 100,000 Rupees.
+// 1 Cr = 10,000,000 Rupees = 100 Lakh.
+// Purse default = 1,000,000,000 Rupees = 100 Cr.
+
+const lakhToRupees = (lakhs: number) => lakhs * 100000;
+const rupeesToCr = (rupees: number) => (rupees / 10000000).toFixed(2);
 
 const Auction = () => {
   const { roomId } = useParams();
@@ -20,8 +30,11 @@ const Auction = () => {
   const [timeLeft, setTimeLeft] = useState(TIMER_DURATION);
   const [isSold, setIsSold] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [bidError, setBidError] = useState('');
   
   const timerRef = useRef<any>(null);
+  const timeLeftRef = useRef(TIMER_DURATION);
+  const prevBidCountRef = useRef(0);
 
   useEffect(() => {
     const adminStr = localStorage.getItem('auction_is_admin');
@@ -32,7 +45,6 @@ const Auction = () => {
   useEffect(() => {
     if (!room?.id) return;
 
-    // Setup Realtime DB Subscriptions ONLY when room.id is known
     const channel = supabase.channel(`room_${roomId}_auction`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bids', filter: `room_id=eq.${room.id}` }, () => {
         loadBids(room.id);
@@ -44,12 +56,14 @@ const Auction = () => {
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'squads', filter: `room_id=eq.${room.id}` }, () => {
         setIsSold(true);
+        loadSquads(room.id);
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `room_id=eq.${room.id}` }, () => {
         loadTeams(room.id);
       })
       .on('broadcast', { event: 'timer_tick' }, payload => {
         setTimeLeft(payload.payload.time);
+        timeLeftRef.current = payload.payload.time;
       })
       .on('broadcast', { event: 'pause_toggle' }, payload => {
         setIsPaused(payload.payload.isPaused);
@@ -64,6 +78,8 @@ const Auction = () => {
   // Whenever room's current player index changes, reset auction UI state
   useEffect(() => {
     setIsSold(false);
+    setBidError('');
+    prevBidCountRef.current = 0;
   }, [room?.current_player_index]);
 
   const loadInitialData = async () => {
@@ -78,13 +94,12 @@ const Auction = () => {
       const me = tms?.find(t => t.user_id === localStorage.getItem('auction_user_id'));
       if (me) setCurrentUserTeam(me);
 
-      // Load squad
       const { data: sqs } = await supabase.from('squads').select('*').eq('room_id', rm.id);
       setSquads(sqs || []);
 
       await loadBids(rm.id);
       
-      // If admin, start the loop
+      // If admin, start the timer
       if (localStorage.getItem('auction_is_admin') === 'true') {
         startTimer(rm.id);
       }
@@ -97,28 +112,31 @@ const Auction = () => {
     setTeams(data || []);
     const me = data?.find((t: any) => t.user_id === localStorage.getItem('auction_user_id'));
     if (me) setCurrentUserTeam(me);
-    // Also reload squads to keep limit checks fresh
+  };
+
+  const loadSquads = async (rmId: string) => {
     const { data: sqs } = await supabase.from('squads').select('*').eq('room_id', rmId);
     setSquads(sqs || []);
   };
 
   const loadBids = async (rmId: string) => {
     if (!rmId) return;
-    const { data } = await supabase.from('bids').select('*').eq('room_id', rmId).order('created_at', { ascending: false });
+    const { data } = await supabase.from('bids').select('*').eq('room_id', rmId).order('amount', { ascending: false });
     setBids(data || []);
   };
 
   // ADMIN ONLY TICK FUNCTION
-  const startTimer = (rmId: string, initialTime = TIMER_DURATION) => {
+  const startTimer = useCallback((rmId: string, initialTime = TIMER_DURATION) => {
     if (timerRef.current) clearInterval(timerRef.current);
     let time = initialTime;
     setTimeLeft(time);
+    timeLeftRef.current = time;
     
     timerRef.current = setInterval(async () => {
       time -= 1;
       
-      // Update local state (Admin)
       setTimeLeft(time);
+      timeLeftRef.current = time;
       
       // Broadcast to everyone else
       supabase.channel(`room_${roomId}_auction`).send({
@@ -132,7 +150,7 @@ const Auction = () => {
         handleTimerEnd(rmId);
       }
     }, 1000);
-  };
+  }, [roomId]);
 
   const handleTimerEnd = async (rmId: string) => {
     // Only Admin runs this
@@ -151,10 +169,10 @@ const Auction = () => {
         bought_for: topBid.amount
       }]);
       
-      // Deduct purse
-      const team = teams.find(t => t.id === topBid.team_id);
-      if (team) {
-        await supabase.from('teams').update({ purse: team.purse - topBid.amount }).eq('id', team.id);
+      // Deduct purse — fetch fresh team data
+      const { data: freshTeam } = await supabase.from('teams').select('*').eq('id', topBid.team_id).single();
+      if (freshTeam) {
+        await supabase.from('teams').update({ purse: freshTeam.purse - topBid.amount }).eq('id', freshTeam.id);
       }
     } else {
       // Unsold
@@ -162,22 +180,48 @@ const Auction = () => {
     }
   };
 
+  // When bids count increases (new bid), admin adds 3 seconds to timer
+  useEffect(() => {
+    if (!isAdmin || !room?.id) return;
+    
+    const currentPlayerBidCount = bids.filter(b => b.player_id === room?.current_player_index).length;
+    
+    if (currentPlayerBidCount > prevBidCountRef.current && prevBidCountRef.current > 0 && !isSold && !isPaused) {
+      // New bid came in — add 3 seconds bonus
+      const newTime = Math.min(timeLeftRef.current + BID_TIME_BONUS, TIMER_DURATION);
+      startTimer(room.id, newTime);
+    }
+    
+    prevBidCountRef.current = currentPlayerBidCount;
+  }, [bids, room?.id, room?.current_player_index, isAdmin, isSold, isPaused]);
+
   const currentPlayer = playersData[room?.current_player_index || 0];
   if (!currentPlayer) return <div>Auction Over</div>;
 
-  const highestBid = bids.length > 0 ? bids[0] : null;
-  const currentPrice = highestBid ? highestBid.amount : currentPlayer.base_price; // in Lakhs
-  const nextBidAmount = highestBid ? currentPrice + INCREMENT_LAKH : currentPrice;
+  // Filter bids for the current player
+  const currentPlayerBids = bids.filter(b => b.player_id === room?.current_player_index);
+  const highestBid = currentPlayerBids.length > 0 ? currentPlayerBids[0] : null; // bids are ordered by amount desc
+  
+  // All prices in Rupees for consistency
+  const basePriceRs = lakhToRupees(currentPlayer.base_price);
+  const currentBidRs = highestBid ? highestBid.amount : basePriceRs;
+  const nextBidRs = highestBid ? currentBidRs + lakhToRupees(INCREMENT_LAKH) : basePriceRs;
 
   const handleBid = async () => {
-    if (!currentUserTeam || isSold) return;
+    if (!currentUserTeam || isSold) {
+      console.log('Bid blocked: no team or already sold');
+      return;
+    }
+    
+    setBidError('');
     
     // Squad size limits
     const mySquad = squads.filter(s => s.team_id === currentUserTeam.id);
     if (mySquad.length >= 25) {
-      alert('Your squad is full! (Max 25 players)');
+      setBidError('Your squad is full! (Max 25 players)');
       return;
     }
+    
     // Overseas limit
     const overseasInSquad = mySquad.filter(s => {
       const p = (playersData as any[])[s.player_id];
@@ -185,40 +229,41 @@ const Auction = () => {
     }).length;
     const currentPlayerData = (playersData as any[])[room?.current_player_index || 0];
     if (currentPlayerData?.is_overseas && overseasInSquad >= 8) {
-      alert('Overseas player limit reached! (Max 8 overseas players)');
+      setBidError('Overseas player limit reached! (Max 8)');
       return;
     }
 
-    // Check purse — amounts stored in paise (Lakh * 100000)
-    const amountInRs = nextBidAmount * 100000;
-    if (currentUserTeam.purse < amountInRs) {
-       alert('Not enough purse limit!');
-       return;
+    // Check purse
+    if (currentUserTeam.purse < nextBidRs) {
+      setBidError('Not enough purse!');
+      return;
     }
     
-    // Insert bid
-    await supabase.from('bids').insert([{
-      room_id: room.id,
-      player_id: room.current_player_index,
-      team_id: currentUserTeam.id,
-      amount: amountInRs
-    }]);
-  };
-  
-  // Actually, we need Admin to reset timer on ANY bid.
-  // We can add a useEffect to listen to `bids` change if Admin.
-  useEffect(() => {
-    if (isAdmin && bids.length > 0 && !isSold && !isPaused) {
-      startTimer(room.id);
+    try {
+      // Insert bid
+      const { error } = await supabase.from('bids').insert([{
+        room_id: room.id,
+        player_id: room.current_player_index,
+        team_id: currentUserTeam.id,
+        amount: nextBidRs
+      }]);
+      
+      if (error) {
+        console.error('Bid insert error:', error);
+        setBidError('Failed to place bid. Try again.');
+      }
+    } catch (err) {
+      console.error('Bid exception:', err);
+      setBidError('Network error. Try again.');
     }
-  }, [bids, isPaused]);
+  };
 
   const togglePause = () => {
     if (!isAdmin) return;
     const newState = !isPaused;
     setIsPaused(newState);
     if (!newState) {
-      startTimer(room.id, timeLeft);
+      startTimer(room.id, timeLeftRef.current);
     } else {
       if (timerRef.current) clearInterval(timerRef.current);
     }
@@ -233,16 +278,9 @@ const Auction = () => {
     if (!isAdmin) return;
     
     try {
-      console.log("Forcing room to RESULTS for:", roomId);
-      // Fallback update using room_code directly
+      if (timerRef.current) clearInterval(timerRef.current);
       await supabase.from('rooms').update({ status: 'RESULTS' }).eq('room_code', roomId);
-      
-      console.log("Navigating directly to results...");
       navigate(`/room/${roomId}/results`);
-      // Force reload UI just in case
-      setTimeout(() => {
-        window.location.href = `/room/${roomId}/results`;
-      }, 500);
     } catch (e) {
       console.error(e);
     }
@@ -259,12 +297,15 @@ const Auction = () => {
 
     // Clear local bids manually so UI snaps immediately, then DB syncs
     setBids([]);
+    prevBidCountRef.current = 0;
     // Clear bids for next player DB side
     await supabase.from('bids').delete().eq('room_id', room.id);
     // Update room
     await supabase.from('rooms').update({ current_player_index: nextIdx }).eq('id', room.id);
     startTimer(room.id);
   };
+
+  const isBidDisabled = isSold || isPaused || timeLeft <= 0 || (highestBid && highestBid.team_id === currentUserTeam?.id);
 
   return (
     <div className="container flex-col" style={{ minHeight: '100vh' }}>
@@ -301,7 +342,7 @@ const Auction = () => {
             </div>
             <div className="flex-col text-right border-l pl-4" style={{ borderLeft: '1px solid var(--glass-border)', paddingLeft: '20px' }}>
               <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Purse Remaining</span>
-              <strong>₹ {(currentUserTeam.purse / 10000000).toFixed(2)} Cr</strong>
+              <strong>₹ {rupeesToCr(currentUserTeam.purse)} Cr</strong>
             </div>
           </div>
         )}
@@ -341,6 +382,11 @@ const Auction = () => {
                 <span className="player-tag" style={{ background: 'rgba(0, 229, 255, 0.1)', color: 'var(--accent-blue)' }}>
                   Base: ₹ {currentPlayer.base_price > 99 ? (currentPlayer.base_price/100).toFixed(2) + ' Cr' : currentPlayer.base_price + ' L'}
                 </span>
+                {currentPlayer.is_overseas && (
+                  <span className="player-tag" style={{ background: 'rgba(255, 190, 11, 0.1)', color: 'var(--accent-gold)' }}>
+                    Overseas
+                  </span>
+                )}
               </div>
 
               {isSold ? (
@@ -348,7 +394,7 @@ const Auction = () => {
                   {highestBid ? (
                     <>
                       <h2 style={{ color: '#00ff7f', margin: 0 }}>SOLD!</h2>
-                      <p style={{ color: '#fff' }}>to {teams.find(t=>t.id===highestBid.team_id)?.team_name} for ₹ {(highestBid.amount / 10000000).toFixed(2)} Cr</p>
+                      <p style={{ color: '#fff' }}>to {teams.find(t=>t.id===highestBid.team_id)?.team_name} for ₹ {rupeesToCr(highestBid.amount)} Cr</p>
                     </>
                   ) : (
                     <h2 style={{ color: '#ff4d4d', margin: 0 }}>UNSOLD</h2>
@@ -358,20 +404,26 @@ const Auction = () => {
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
                   <div style={{ fontSize: '1.2rem', color: 'var(--text-muted)' }}>Current Bid</div>
                   <div style={{ fontSize: '4rem', fontWeight: '800', lineHeight: 1, color: highestBid ? 'var(--accent-gold)' : '#fff' }}>
-                    ₹ {highestBid ? (highestBid.amount / 10000000).toFixed(2) : (currentPlayer.base_price > 99 ? (currentPlayer.base_price/100).toFixed(2) : currentPlayer.base_price/100)} Cr
+                    ₹ {rupeesToCr(currentBidRs)} Cr
                   </div>
                   <div style={{ fontSize: '1.2rem' }}>
                     {highestBid ? `Bid by ${teams.find(t=>t.id===highestBid.team_id)?.team_name}` : 'Waiting for bids...'}
                     {isPaused && <span style={{ color: '#ffbe0b', marginLeft: '10px' }}>(Paused)</span>}
                   </div>
 
+                  {bidError && (
+                    <div style={{ color: '#ff4d4d', background: 'rgba(255,0,0,0.1)', padding: '8px 16px', borderRadius: '8px', fontSize: '0.9rem' }}>
+                      {bidError}
+                    </div>
+                  )}
+
                   <button 
                     className="btn-bid" 
                     onClick={handleBid} 
-                    disabled={isSold || isPaused || timeLeft <= 0 || (highestBid && highestBid.team_id === currentUserTeam?.id)}
+                    disabled={!!isBidDisabled}
                     style={{ marginTop: '20px' }}
                   >
-                    Bid ₹ {(nextBidAmount * 100000 / 10000000).toFixed(2)} Cr
+                    Bid ₹ {rupeesToCr(nextBidRs)} Cr
                   </button>
                 </div>
               )}
@@ -393,16 +445,16 @@ const Auction = () => {
             <Gavel size={20} /> Bid Log
           </h3>
           <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {bids.map(bid => {
+            {currentPlayerBids.map(bid => {
               const t = teams.find(tm => tm.id === bid.team_id);
               return (
                 <div key={bid.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '12px', background: 'rgba(255,255,255,0.05)', borderRadius: '8px' }}>
                   <span style={{ fontWeight: 500, color: t?.team_name === currentUserTeam?.team_name ? 'var(--accent-blue)' : '#fff' }}>{t?.team_name}</span>
-                  <span style={{ color: 'var(--accent-gold)' }}>₹ {(bid.amount / 10000000).toFixed(2)} Cr</span>
+                  <span style={{ color: 'var(--accent-gold)' }}>₹ {rupeesToCr(bid.amount)} Cr</span>
                 </div>
               );
             })}
-            {bids.length === 0 && <div style={{ color: '#888', textAlign: 'center', marginTop: '20px' }}>No bids yet</div>}
+            {currentPlayerBids.length === 0 && <div style={{ color: '#888', textAlign: 'center', marginTop: '20px' }}>No bids yet</div>}
           </div>
         </div>
 
