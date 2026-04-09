@@ -32,19 +32,10 @@ const Lobby = () => {
     setUserId(uid);
     setIsAdmin(adminStr === 'true');
     loadRoomAndParticipants();
-  }, [roomId]);
 
-  // Set up realtime subscriptions ONLY after room is loaded (room.id is known)
-  useEffect(() => {
-    if (!room?.id) return;
-
+    // Subscribe immediately — rooms table uses room_code (no UUID needed)
+    // users & teams subscriptions are added once we have room.id (see below)
     const ch = supabase.channel(`lobby_${roomId}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'users', filter: `room_id=eq.${room.id}` }, () => {
-        loadRoomAndParticipants();
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `room_id=eq.${room.id}` }, () => {
-        loadRoomAndParticipants();
-      })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `room_code=eq.${roomId}` }, payload => {
         const updated = payload.new as any;
         if (updated.status === 'AUCTION') {
@@ -53,8 +44,32 @@ const Lobby = () => {
       })
       .subscribe();
 
-    return () => { supabase.removeChannel(ch); };
-  }, [room?.id, roomId]);
+    // Safety net: poll every 3 seconds in case realtime misses events
+    const pollInterval = setInterval(() => {
+      loadRoomAndParticipants();
+    }, 3000);
+
+    return () => {
+      supabase.removeChannel(ch);
+      clearInterval(pollInterval);
+    };
+  }, [roomId]);
+
+  // Once we have room.id, subscribe to users & teams realtime
+  useEffect(() => {
+    if (!room?.id) return;
+
+    const ch2 = supabase.channel(`lobby_data_${roomId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'users', filter: `room_id=eq.${room.id}` }, () => {
+        loadRoomAndParticipants();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `room_id=eq.${room.id}` }, () => {
+        loadRoomAndParticipants();
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(ch2); };
+  }, [room?.id]);
 
   const loadRoomAndParticipants = async () => {
     try {
