@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -6,317 +6,285 @@ import { Timer, Gavel, User, ChevronRight, Pause, Play, Square } from 'lucide-re
 import playersData from '../data/players.json';
 
 const TIMER_DURATION = 15;
-const BID_TIME_BONUS = 3;
+const BID_BONUS = 3;
 const INCREMENT_LAKH = 10;
 
-const lakhToRupees = (lakhs: number) => lakhs * 100000;
-const rupeesToCr = (rupees: number) => (rupees / 10000000).toFixed(2);
+const toRupees = (lakhs: number) => lakhs * 100_000;
+const toCr = (rupees: number) => (rupees / 10_000_000).toFixed(2);
 
 const Auction = () => {
-  const { roomId } = useParams();
+  const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
+
+  const isAdmin = localStorage.getItem('auction_is_admin') === 'true';
+  const myUserId = localStorage.getItem('auction_user_id') || '';
 
   const [room, setRoom] = useState<any>(null);
   const [teams, setTeams] = useState<any[]>([]);
   const [bids, setBids] = useState<any[]>([]);
   const [squads, setSquads] = useState<any[]>([]);
-  const [currentUserTeam, setCurrentUserTeam] = useState<any>(null);
-  const [isAdmin] = useState(() => localStorage.getItem('auction_is_admin') === 'true');
+  const [myTeam, setMyTeam] = useState<any>(null);
   const [timeLeft, setTimeLeft] = useState(TIMER_DURATION);
   const [isSold, setIsSold] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
-  const [bidError, setBidError] = useState('');
+  const [bidMsg, setBidMsg] = useState('');
 
-  // Refs so async callbacks always have fresh values (avoids stale closure bugs)
+  // Refs — ensure async callbacks always read fresh values
   const roomRef = useRef<any>(null);
   const teamsRef = useRef<any[]>([]);
   const timerRef = useRef<any>(null);
-  const timeLeftRef = useRef(TIMER_DURATION);
+  const timeRef = useRef(TIMER_DURATION);
   const isSoldRef = useRef(false);
   const isPausedRef = useRef(false);
-  const prevBidCountRef = useRef(0);
+  const prevBidCount = useRef(0);
+  const channelRef = useRef<any>(null);  // ← single channel ref for send+receive
 
-  // Keep refs in sync with state
-  const updateRoom = (r: any) => { roomRef.current = r; setRoom(r); };
-  const updateTeams = (t: any[]) => { teamsRef.current = t; setTeams(t); };
-  const updateIsSold = (v: boolean) => { isSoldRef.current = v; setIsSold(v); };
-  const updateIsPaused = (v: boolean) => { isPausedRef.current = v; setIsPaused(v); };
+  // Sync state + refs together
+  const setRoom2 = (r: any) => { roomRef.current = r; setRoom(r); };
+  const setTeams2 = (t: any[]) => { teamsRef.current = t; setTeams(t); };
+  const setSold = (v: boolean) => { isSoldRef.current = v; setIsSold(v); };
+  const setPaused = (v: boolean) => { isPausedRef.current = v; setIsPaused(v); };
 
-  // ──── Data Loaders ────────────────────────────────────────────────────────
+  // ─── Data fetchers ───────────────────────────────────────────────────────
 
-  const loadBids = useCallback(async (rmId: string) => {
-    const { data } = await supabase.from('bids').select('*').eq('room_id', rmId).order('amount', { ascending: false });
-    setBids(data || []);
-    return data || [];
-  }, []);
+  const fetchAll = async (rmId: string) => {
+    const [bRes, tRes, sRes] = await Promise.all([
+      supabase.from('bids').select('*').eq('room_id', rmId).order('amount', { ascending: false }),
+      supabase.from('teams').select('*').eq('room_id', rmId),
+      supabase.from('squads').select('*').eq('room_id', rmId),
+    ]);
+    setBids(bRes.data || []);
+    const tms = tRes.data || [];
+    setTeams2(tms);
+    const me = tms.find((t: any) => t.user_id === myUserId);
+    if (me) setMyTeam(me);
+    setSquads(sRes.data || []);
+    return { bids: bRes.data || [], teams: tms };
+  };
 
-  const loadTeams = useCallback(async (rmId: string) => {
-    const { data } = await supabase.from('teams').select('*').eq('room_id', rmId);
-    updateTeams(data || []);
-    const me = data?.find((t: any) => t.user_id === localStorage.getItem('auction_user_id'));
-    if (me) setCurrentUserTeam(me);
-    return data || [];
-  }, []);
+  const fetchRoom = async () => {
+    const { data: rm } = await supabase.from('rooms').select('*').eq('room_code', roomId).single();
+    if (!rm) return null;
+    const prev = roomRef.current;
+    setRoom2(rm);
+    if (rm.status === 'RESULTS') { navigate(`/room/${roomId}/results`); return rm; }
+    // Player changed → reset sold state
+    if (prev && rm.current_player_index !== prev.current_player_index) {
+      setSold(false);
+      setBidMsg('');
+      prevBidCount.current = 0;
+    }
+    return rm;
+  };
 
-  const loadSquads = useCallback(async (rmId: string) => {
-    const { data } = await supabase.from('squads').select('*').eq('room_id', rmId);
-    setSquads(data || []);
-    return data || [];
-  }, []);
+  // ─── Timer (admin only) ──────────────────────────────────────────────────
 
-  // ──── Timer (admin only) ──────────────────────────────────────────────────
+  const stopTimer = () => {
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+  };
 
-  const handleTimerEnd = useCallback(async (rmId: string) => {
-    const currentIndex = roomRef.current?.current_player_index ?? 0;
+  const sendTick = (time: number) => {
+    channelRef.current?.send({ type: 'broadcast', event: 'timer_tick', payload: { time } });
+  };
 
-    // Fetch fresh bids for this player
-    const { data: currentBids } = await supabase
+  const handleTimerEnd = async () => {
+    const rmId = roomRef.current?.id;
+    const playerIdx = roomRef.current?.current_player_index ?? 0;
+    if (!rmId) return;
+
+    const { data: topBids } = await supabase
       .from('bids').select('*')
       .eq('room_id', rmId)
-      .eq('player_id', currentIndex)
+      .eq('player_id', playerIdx)
       .order('amount', { ascending: false })
       .limit(1);
 
-    if (currentBids && currentBids.length > 0) {
-      const topBid = currentBids[0];
-
+    if (topBids && topBids.length > 0) {
+      const top = topBids[0];
       await supabase.from('squads').insert([{
-        room_id: rmId,
-        team_id: topBid.team_id,
-        player_id: currentIndex,
-        bought_for: topBid.amount
+        room_id: rmId, team_id: top.team_id,
+        player_id: playerIdx, bought_for: top.amount,
       }]);
-
-      // Deduct purse with fresh team data
-      const { data: freshTeam } = await supabase.from('teams').select('*').eq('id', topBid.team_id).single();
+      const { data: freshTeam } = await supabase.from('teams').select('*').eq('id', top.team_id).single();
       if (freshTeam) {
-        await supabase.from('teams').update({ purse: freshTeam.purse - topBid.amount }).eq('id', freshTeam.id);
+        await supabase.from('teams').update({ purse: freshTeam.purse - top.amount }).eq('id', top.team_id);
       }
     } else {
-      // Unsold — mark via broadcast so all clients update
-      updateIsSold(true);
-      supabase.channel(`room_${roomId}_auction`).send({
-        type: 'broadcast', event: 'player_sold',
-        payload: { sold: false, playerIndex: currentIndex }
-      });
+      // Unsold — broadcast so all clients know
+      setSold(true);
+      channelRef.current?.send({ type: 'broadcast', event: 'sold', payload: { sold: false } });
     }
-  }, [roomId]);
+  };
 
-  const startTimer = useCallback((rmId: string, initialTime = TIMER_DURATION) => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    let time = initialTime;
-    setTimeLeft(time);
-    timeLeftRef.current = time;
+  const startTimer = (initialTime = TIMER_DURATION) => {
+    stopTimer();
+    let t = initialTime;
+    setTimeLeft(t); timeRef.current = t;
+    sendTick(t);
 
     timerRef.current = setInterval(async () => {
-      if (isPausedRef.current) return; // skip tick if paused
-
-      time -= 1;
-      setTimeLeft(time);
-      timeLeftRef.current = time;
-
-      supabase.channel(`room_${roomId}_auction`).send({
-        type: 'broadcast', event: 'timer_tick', payload: { time }
-      });
-
-      if (time <= 0) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-        handleTimerEnd(rmId);
+      if (isPausedRef.current) return;
+      t -= 1;
+      setTimeLeft(t); timeRef.current = t;
+      sendTick(t);
+      if (t <= 0) {
+        stopTimer();
+        await handleTimerEnd();
       }
     }, 1000);
-  }, [roomId, handleTimerEnd]);
+  };
 
-  // ──── Initial Load + Realtime Setup ──────────────────────────────────────
+  // ─── Initialise ──────────────────────────────────────────────────────────
 
   useEffect(() => {
-    let channel: any = null;
+    let pollInterval: any;
 
     const init = async () => {
-      const { data: rm } = await supabase.from('rooms').select('*').eq('room_code', roomId).single();
+      // 1. Load room first
+      const rm = await fetchRoom();
       if (!rm) return;
-      updateRoom(rm);
 
-      const [_tms, _sqs, bidsData] = await Promise.all([
-        loadTeams(rm.id),
-        loadSquads(rm.id),
-        loadBids(rm.id),
-      ]);
+      // 2. Load all data
+      const { bids: initialBids } = await fetchAll(rm.id);
+      prevBidCount.current = initialBids.filter((b: any) => b.player_id === rm.current_player_index).length;
 
-      prevBidCountRef.current = (bidsData as any[]).filter(b => b.player_id === rm.current_player_index).length;
+      // 3. Single channel for BOTH send and receive
+      channelRef.current = supabase.channel(`room_${roomId}_v2`);
 
-      // Subscribe to realtime
-      channel = supabase.channel(`room_${roomId}_auction`)
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'bids', filter: `room_id=eq.${rm.id}` }, async () => {
-          const fresh = await loadBids(rm.id);
-
-          if (isAdmin) {
-            const currentIdx = roomRef.current?.current_player_index ?? 0;
-            const playerBids = (fresh as any[]).filter(b => b.player_id === currentIdx);
-            if (playerBids.length > prevBidCountRef.current && !isSoldRef.current && !isPausedRef.current) {
-              const newTime = Math.min(timeLeftRef.current + BID_TIME_BONUS, TIMER_DURATION);
-              startTimer(rm.id, newTime);
-            }
-            prevBidCountRef.current = playerBids.length;
-          }
+      channelRef.current
+        .on('broadcast', { event: 'timer_tick' }, (p: any) => {
+          setTimeLeft(p.payload.time);
+          timeRef.current = p.payload.time;
         })
-        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `room_code=eq.${roomId}` }, payload => {
-          updateRoom(payload.new);
-          if ((payload.new as any).status === 'RESULTS') navigate(`/room/${roomId}/results`);
-          if ((payload.new as any).current_player_index !== roomRef.current?.current_player_index) {
-            updateIsSold(false);
-            setBidError('');
-            prevBidCountRef.current = 0;
-          }
-        })
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'squads', filter: `room_id=eq.${rm.id}` }, () => {
-          updateIsSold(true);
-          loadSquads(rm.id);
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'teams', filter: `room_id=eq.${rm.id}` }, () => {
-          loadTeams(rm.id);
-        })
-        .on('broadcast', { event: 'timer_tick' }, payload => {
-          setTimeLeft(payload.payload.time);
-          timeLeftRef.current = payload.payload.time;
-        })
-        .on('broadcast', { event: 'pause_toggle' }, payload => {
-          updateIsPaused(payload.payload.isPaused);
-        })
-        .on('broadcast', { event: 'player_sold' }, () => {
-          if (!isAdmin) updateIsSold(true);
-        })
-        .subscribe((status: string) => {
-          if (status === 'SUBSCRIBED' && isAdmin) {
-            startTimer(rm.id);
-          }
+        .on('broadcast', { event: 'pause_toggle' }, (p: any) => setPaused(p.payload.isPaused))
+        .on('broadcast', { event: 'sold' }, () => setSold(true))
+        .subscribe(() => {
+          // Admin starts timer once subscribed
+          if (isAdmin) startTimer();
         });
+
+      // 4. Poll every 2 s for data (reliable cross-tab sync)
+      pollInterval = setInterval(async () => {
+        await fetchRoom();
+        if (!roomRef.current?.id) return;
+        const { bids: freshBids } = await fetchAll(roomRef.current.id);
+
+        // Admin: if new bid came in → add bonus time
+        if (isAdmin && !isSoldRef.current && !isPausedRef.current) {
+          const playerBids = freshBids.filter(
+            (b: any) => b.player_id === (roomRef.current?.current_player_index ?? 0)
+          );
+          if (playerBids.length > prevBidCount.current) {
+            prevBidCount.current = playerBids.length;
+            const newTime = Math.min(timeRef.current + BID_BONUS, TIMER_DURATION);
+            startTimer(newTime);
+          }
+        }
+      }, 2000);
     };
 
     init();
 
     return () => {
-      if (channel) supabase.removeChannel(channel);
-      if (timerRef.current) clearInterval(timerRef.current);
+      stopTimer();
+      clearInterval(pollInterval);
+      if (channelRef.current) supabase.removeChannel(channelRef.current);
     };
   }, [roomId]);
 
-  // ──── Player index change — reset UI ─────────────────────────────────────
+  // ─── Derived values ──────────────────────────────────────────────────────
 
-  useEffect(() => {
-    if (!room) return;
-    updateIsSold(false);
-    setBidError('');
-    prevBidCountRef.current = 0;
-    setBids([]);
-    if (isAdmin && room.id) {
-      loadBids(room.id);
-    }
-  }, [room?.current_player_index]);
+  const currentIdx = room?.current_player_index ?? 0;
+  const currentPlayer = (playersData as any[])[currentIdx];
+  const playerBids = bids.filter(b => b.player_id === currentIdx);
+  const topBid = playerBids[0] ?? null;
+  const basePriceRs = toRupees(currentPlayer?.base_price ?? 0);
+  const currentBidRs = topBid ? topBid.amount : basePriceRs;
+  const nextBidRs = topBid ? currentBidRs + toRupees(INCREMENT_LAKH) : basePriceRs;
 
-  // ──── Derived values ──────────────────────────────────────────────────────
-
-  const currentIndex = room?.current_player_index ?? 0;
-  const currentPlayer = (playersData as any[])[currentIndex];
-
-  if (!room) {
-    return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', color: '#fff', fontSize: '1.5rem' }}>
-        Loading auction...
-      </div>
-    );
-  }
-
-  if (!currentPlayer) {
-    return <div style={{ color: '#fff', textAlign: 'center', marginTop: '40px' }}>Auction Over</div>;
-  }
-
-  const currentPlayerBids = bids.filter(b => b.player_id === currentIndex);
-  const highestBid = currentPlayerBids.length > 0 ? currentPlayerBids[0] : null;
-  const basePriceRs = lakhToRupees(currentPlayer.base_price);
-  const currentBidRs = highestBid ? highestBid.amount : basePriceRs;
-  const nextBidRs = highestBid ? currentBidRs + lakhToRupees(INCREMENT_LAKH) : basePriceRs;
-
-  // ──── Actions ─────────────────────────────────────────────────────────────
+  // ─── Actions ─────────────────────────────────────────────────────────────
 
   const handleBid = async () => {
-    if (!currentUserTeam || isSold) return;
-    setBidError('');
+    setBidMsg('');
+    if (!myTeam) { setBidMsg('You have no team assigned!'); return; }
+    if (isSold) { setBidMsg('Round is over.'); return; }
+    if (isPaused) { setBidMsg('Auction is paused.'); return; }
+    if (timeLeft <= 0) { setBidMsg('Time is up!'); return; }
+    if (topBid && topBid.team_id === myTeam.id) { setBidMsg("You're already the highest bidder!"); return; }
 
-    const mySquad = squads.filter(s => s.team_id === currentUserTeam.id);
-    if (mySquad.length >= 25) { setBidError('Squad full! (Max 25)'); return; }
-
-    const overseasInSquad = mySquad.filter(s => (playersData as any[])[s.player_id]?.is_overseas).length;
-    if (currentPlayer.is_overseas && overseasInSquad >= 8) { setBidError('Overseas limit reached! (Max 8)'); return; }
-    if (currentUserTeam.purse < nextBidRs) { setBidError('Not enough purse!'); return; }
+    const mySquad = squads.filter(s => s.team_id === myTeam.id);
+    if (mySquad.length >= 25) { setBidMsg('Squad full! (Max 25 players)'); return; }
+    if (currentPlayer?.is_overseas) {
+      const overseas = mySquad.filter(s => (playersData as any[])[s.player_id]?.is_overseas).length;
+      if (overseas >= 8) { setBidMsg('Overseas limit reached! (Max 8)'); return; }
+    }
+    if (myTeam.purse < nextBidRs) { setBidMsg('Not enough purse!'); return; }
 
     const { error } = await supabase.from('bids').insert([{
       room_id: room.id,
-      player_id: currentIndex,
-      team_id: currentUserTeam.id,
-      amount: nextBidRs
+      player_id: currentIdx,
+      team_id: myTeam.id,
+      amount: nextBidRs,
     }]);
 
     if (error) {
       console.error('Bid error:', error);
-      setBidError('Failed to place bid. Try again.');
+      setBidMsg('Bid failed: ' + error.message);
     }
   };
 
   const togglePause = () => {
     if (!isAdmin) return;
-    const newPaused = !isPausedRef.current;
-    updateIsPaused(newPaused);
-    if (!newPaused) {
-      startTimer(room.id, timeLeftRef.current);
-    } else {
-      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-    }
-    supabase.channel(`room_${roomId}_auction`).send({
-      type: 'broadcast', event: 'pause_toggle', payload: { isPaused: newPaused }
-    });
+    const next = !isPausedRef.current;
+    setPaused(next);
+    if (!next) startTimer(timeRef.current);
+    else stopTimer();
+    channelRef.current?.send({ type: 'broadcast', event: 'pause_toggle', payload: { isPaused: next } });
   };
 
   const handleEndAuction = async () => {
     if (!isAdmin) return;
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    stopTimer();
     await supabase.from('rooms').update({ status: 'RESULTS' }).eq('room_code', roomId);
     navigate(`/room/${roomId}/results`);
   };
 
   const handleNextPlayer = async () => {
     if (!isAdmin || !room) return;
-    const nextIdx = currentIndex + 1;
+    const nextIdx = currentIdx + 1;
     if (nextIdx >= (playersData as any[]).length) {
       await supabase.from('rooms').update({ status: 'RESULTS' }).eq('id', room.id);
       return;
     }
-    setBids([]);
-    prevBidCountRef.current = 0;
+    setBids([]); prevBidCount.current = 0;
     await supabase.from('bids').delete().eq('room_id', room.id);
     await supabase.from('rooms').update({ current_player_index: nextIdx }).eq('id', room.id);
-    startTimer(room.id);
+    setSold(false);
+    startTimer();
   };
 
-  const isBidDisabled = isSold || isPaused || timeLeft <= 0 || !currentUserTeam ||
-    (highestBid && highestBid.team_id === currentUserTeam?.id);
+  // ─── Loading state ───────────────────────────────────────────────────────
 
-  // ──── UI ─────────────────────────────────────────────────────────────────
+  if (!room || !currentPlayer) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', color: '#fff', fontSize: '1.4rem' }}>
+        Loading auction...
+      </div>
+    );
+  }
+
+  const bidDisabled = isSold || isPaused || timeLeft <= 0 || !myTeam ||
+    !!(topBid && topBid.team_id === myTeam?.id);
+
+  // ─── UI ──────────────────────────────────────────────────────────────────
 
   return (
     <div className="container flex-col" style={{ minHeight: '100vh' }}>
-
       {/* Top Bar */}
       <div className="glass-panel" style={{ padding: '15px 30px', display: 'flex', justifyContent: 'space-between', marginBottom: '30px', flexWrap: 'wrap', gap: '20px' }}>
         <div style={{ display: 'flex', gap: '20px', alignItems: 'center' }}>
-          <div className="flex-col">
-            <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Room</span>
-            <strong>{roomId}</strong>
-          </div>
-          <div className="flex-col">
-            <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Player</span>
-            <strong>{currentIndex + 1} / {(playersData as any[]).length}</strong>
-          </div>
+          <div className="flex-col"><span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Room</span><strong>{roomId}</strong></div>
+          <div className="flex-col"><span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Player</span><strong>{currentIdx + 1} / {(playersData as any[]).length}</strong></div>
         </div>
 
         {isAdmin && (
@@ -330,84 +298,55 @@ const Auction = () => {
           </div>
         )}
 
-        {currentUserTeam && (
+        {myTeam && (
           <div style={{ display: 'flex', gap: '20px', alignItems: 'center', background: 'rgba(255,255,255,0.05)', padding: '10px 20px', borderRadius: '12px' }}>
-            <div className="flex-col">
-              <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Your Team</span>
-              <strong style={{ color: 'var(--accent-gold)' }}>{currentUserTeam.team_name}</strong>
-            </div>
-            <div className="flex-col" style={{ borderLeft: '1px solid var(--glass-border)', paddingLeft: '20px' }}>
-              <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Purse Left</span>
-              <strong>₹ {rupeesToCr(currentUserTeam.purse)} Cr</strong>
-            </div>
+            <div className="flex-col"><span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Your Team</span><strong style={{ color: 'var(--accent-gold)' }}>{myTeam.team_name}</strong></div>
+            <div className="flex-col" style={{ borderLeft: '1px solid var(--glass-border)', paddingLeft: '20px' }}><span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Purse Left</span><strong>₹ {toCr(myTeam.purse)} Cr</strong></div>
           </div>
         )}
+        {!myTeam && <div style={{ color: '#ff4d4d', fontSize: '0.9rem' }}>⚠️ No team assigned — go back to lobby</div>}
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(400px, 2fr) 1fr', gap: '30px', flex: 1 }}>
-
-        {/* Main Auction Area */}
+        {/* Main Area */}
         <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'hidden' }}>
-
           <div style={{ position: 'absolute', top: 30, right: 30, display: 'flex', alignItems: 'center', gap: '10px', fontSize: '2rem', fontWeight: 'bold', color: timeLeft <= 5 ? '#ff007f' : '#fff' }} className={timeLeft <= 5 ? 'timer-pulse' : ''}>
             <Timer size={32} /> {timeLeft}s
           </div>
 
           <AnimatePresence mode="wait">
-            <motion.div
-              key={currentIndex}
-              initial={{ opacity: 0, y: 50, scale: 0.9 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -50, scale: 1.1 }}
-              transition={{ duration: 0.5 }}
-              style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center' }}
-            >
+            <motion.div key={currentIdx} initial={{ opacity: 0, y: 50 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -50 }} transition={{ duration: 0.4 }} style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
               <div style={{ width: '120px', height: '120px', borderRadius: '50%', background: 'linear-gradient(135deg, var(--bg-secondary), var(--glass-bg))', border: '2px solid var(--glass-border)', display: 'flex', justifyContent: 'center', alignItems: 'center', marginBottom: '20px' }}>
                 <User size={64} color="var(--text-muted)" />
               </div>
-
               <h1>{currentPlayer.name}</h1>
-
-              <div style={{ display: 'flex', gap: '15px', marginBottom: '40px', flexWrap: 'wrap', justifyContent: 'center' }}>
+              <div style={{ display: 'flex', gap: '12px', marginBottom: '40px', flexWrap: 'wrap', justifyContent: 'center' }}>
                 <span className="player-tag">{currentPlayer.role}</span>
                 <span className="player-tag" style={{ background: 'rgba(0,229,255,0.1)', color: 'var(--accent-blue)' }}>
                   Base: ₹ {currentPlayer.base_price > 99 ? (currentPlayer.base_price / 100).toFixed(2) + ' Cr' : currentPlayer.base_price + ' L'}
                 </span>
-                {currentPlayer.is_overseas && (
-                  <span className="player-tag" style={{ background: 'rgba(255,190,11,0.1)', color: 'var(--accent-gold)' }}>Overseas</span>
-                )}
+                {currentPlayer.is_overseas && <span className="player-tag" style={{ background: 'rgba(255,190,11,0.1)', color: 'var(--accent-gold)' }}>Overseas</span>}
               </div>
 
               {isSold ? (
                 <div style={{ background: 'rgba(0,255,127,0.1)', border: '1px solid #00ff7f', padding: '20px 40px', borderRadius: '16px' }}>
-                  {highestBid ? (
-                    <>
-                      <h2 style={{ color: '#00ff7f', margin: 0 }}>SOLD!</h2>
-                      <p style={{ color: '#fff' }}>to {teams.find(t => t.id === highestBid.team_id)?.team_name} for ₹ {rupeesToCr(highestBid.amount)} Cr</p>
-                    </>
-                  ) : (
-                    <h2 style={{ color: '#ff4d4d', margin: 0 }}>UNSOLD</h2>
-                  )}
+                  {topBid
+                    ? <><h2 style={{ color: '#00ff7f', margin: 0 }}>SOLD!</h2><p style={{ color: '#fff' }}>to {teams.find(t => t.id === topBid.team_id)?.team_name} for ₹ {toCr(topBid.amount)} Cr</p></>
+                    : <h2 style={{ color: '#ff4d4d', margin: 0 }}>UNSOLD</h2>}
                 </div>
               ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '20px' }}>
-                  <div style={{ fontSize: '1.2rem', color: 'var(--text-muted)' }}>Current Bid</div>
-                  <div style={{ fontSize: '4rem', fontWeight: '800', lineHeight: 1, color: highestBid ? 'var(--accent-gold)' : '#fff' }}>
-                    ₹ {rupeesToCr(currentBidRs)} Cr
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
+                  <div style={{ fontSize: '1.1rem', color: 'var(--text-muted)' }}>Current Bid</div>
+                  <div style={{ fontSize: '4rem', fontWeight: 800, lineHeight: 1, color: topBid ? 'var(--accent-gold)' : '#fff' }}>
+                    ₹ {toCr(currentBidRs)} Cr
                   </div>
-                  <div style={{ fontSize: '1.2rem' }}>
-                    {highestBid ? `Bid by ${teams.find(t => t.id === highestBid.team_id)?.team_name}` : 'Waiting for bids...'}
-                    {isPaused && <span style={{ color: '#ffbe0b', marginLeft: '10px' }}>(Paused)</span>}
+                  <div style={{ fontSize: '1.1rem', color: '#ccc' }}>
+                    {topBid ? `Bid by ${teams.find(t => t.id === topBid.team_id)?.team_name}` : 'No bids yet — be first!'}
+                    {isPaused && <span style={{ color: '#ffbe0b', marginLeft: '10px' }}> (Paused)</span>}
                   </div>
-
-                  {bidError && (
-                    <div style={{ color: '#ff4d4d', background: 'rgba(255,0,0,0.1)', padding: '8px 16px', borderRadius: '8px', fontSize: '0.9rem' }}>
-                      {bidError}
-                    </div>
-                  )}
-
-                  <button className="btn-bid" onClick={handleBid} disabled={!!isBidDisabled} style={{ marginTop: '20px' }}>
-                    Bid ₹ {rupeesToCr(nextBidRs)} Cr
+                  {bidMsg && <div style={{ color: '#ff7070', background: 'rgba(255,0,0,0.1)', padding: '8px 16px', borderRadius: '8px', fontSize: '0.9rem' }}>{bidMsg}</div>}
+                  <button className="btn-bid" onClick={handleBid} disabled={bidDisabled} style={{ marginTop: '10px' }}>
+                    Bid ₹ {toCr(nextBidRs)} Cr
                   </button>
                 </div>
               )}
@@ -423,23 +362,20 @@ const Auction = () => {
 
         {/* Bid Log */}
         <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column' }}>
-          <h3 style={{ marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <Gavel size={20} /> Bid Log
-          </h3>
+          <h3 style={{ marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '10px' }}><Gavel size={20} /> Bid Log</h3>
           <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            {currentPlayerBids.map(bid => {
+            {playerBids.map(bid => {
               const t = teams.find(tm => tm.id === bid.team_id);
               return (
                 <div key={bid.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '12px', background: 'rgba(255,255,255,0.05)', borderRadius: '8px' }}>
-                  <span style={{ fontWeight: 500, color: t?.id === currentUserTeam?.id ? 'var(--accent-blue)' : '#fff' }}>{t?.team_name}</span>
-                  <span style={{ color: 'var(--accent-gold)' }}>₹ {rupeesToCr(bid.amount)} Cr</span>
+                  <span style={{ fontWeight: 500, color: t?.id === myTeam?.id ? 'var(--accent-blue)' : '#fff' }}>{t?.team_name}</span>
+                  <span style={{ color: 'var(--accent-gold)' }}>₹ {toCr(bid.amount)} Cr</span>
                 </div>
               );
             })}
-            {currentPlayerBids.length === 0 && <div style={{ color: '#888', textAlign: 'center', marginTop: '20px' }}>No bids yet</div>}
+            {playerBids.length === 0 && <div style={{ color: '#888', textAlign: 'center', marginTop: '20px' }}>No bids yet</div>}
           </div>
         </div>
-
       </div>
     </div>
   );
