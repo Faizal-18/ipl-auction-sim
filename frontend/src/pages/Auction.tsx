@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Timer, Gavel, User, ChevronRight, Pause, Play, Square } from 'lucide-react';
+import { Timer, Gavel, User, ChevronRight, Pause, Play, Square, Plane } from 'lucide-react';
 import playersData from '../data/players.json';
 
 const TIMER_DURATION = 15;
@@ -342,7 +342,7 @@ const Auction = () => {
                 <span className="player-tag" style={{ background: 'rgba(0,229,255,0.1)', color: 'var(--accent-blue)' }}>
                   Base: ₹ {currentPlayer.base_price > 99 ? (currentPlayer.base_price / 100).toFixed(2) + ' Cr' : currentPlayer.base_price + ' L'}
                 </span>
-                {currentPlayer.is_overseas && <span className="player-tag" style={{ background: 'rgba(255,190,11,0.1)', color: 'var(--accent-gold)' }}>Overseas</span>}
+                {currentPlayer.is_overseas && <span className="player-tag" style={{ background: 'rgba(255,190,11,0.1)', color: 'var(--accent-gold)', display: 'flex', alignItems: 'center', gap: '6px' }}><Plane size={16} /> Overseas</span>}
               </div>
 
               {isSold ? (
@@ -394,6 +394,30 @@ const Auction = () => {
           </div>
         </div>
       </div>
+
+      {/* Squad List Section */}
+      {myTeam && (
+        <div className="glass-panel" style={{ marginTop: '30px', marginBottom: '30px' }}>
+          <h3 style={{ marginBottom: '15px' }}>My Squad ({squads.filter(s => s.team_id === myTeam.id).length}/25)</h3>
+          <div style={{ display: 'flex', gap: '15px', overflowX: 'auto', paddingBottom: '10px' }}>
+            {squads.filter(s => s.team_id === myTeam.id).map(s => {
+              const p = (playersData as any[])[s.player_id];
+              return (
+                <div key={s.id} style={{ background: 'rgba(255,255,255,0.05)', padding: '12px 15px', borderRadius: '8px', minWidth: '180px', display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                  <span style={{ fontWeight: 'bold', fontSize: '0.95rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p?.name}</span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: '#aaa' }}>
+                    <span>{p?.role}</span>
+                    <span style={{ color: 'var(--accent-gold)', fontWeight: 600 }}>₹ {toCr(s.bought_for)} Cr</span>
+                  </div>
+                </div>
+              );
+            })}
+            {squads.filter(s => s.team_id === myTeam.id).length === 0 && (
+              <div style={{ color: '#888', fontStyle: 'italic', padding: '10px 0' }}>No players bought yet.</div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
