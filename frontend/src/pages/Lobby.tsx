@@ -23,7 +23,6 @@ const Lobby = () => {
   const [participants, setParticipants] = useState<any[]>([]);
   const [selectedTeam, setSelectedTeam] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [room, setRoom] = useState<any>(null);
   const [userId, setUserId] = useState('');
 
   const roomRef = useRef<any>(null);
@@ -33,7 +32,6 @@ const Lobby = () => {
       const { data: rm } = await supabase.from('rooms').select('*').eq('room_code', roomId).single();
       if (!rm) return;
       roomRef.current = rm;
-      setRoom(rm);
 
       if (rm.status === 'AUCTION') { navigate(`/room/${roomId}/auction`); return; }
 
