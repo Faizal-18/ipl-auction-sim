@@ -137,7 +137,7 @@ const Auction = () => {
       if (!rm) return;
       updateRoom(rm);
 
-      const [tms, sqs, bidsData] = await Promise.all([
+      const [_tms, _sqs, bidsData] = await Promise.all([
         loadTeams(rm.id),
         loadSquads(rm.id),
         loadBids(rm.id),
@@ -183,7 +183,7 @@ const Auction = () => {
         .on('broadcast', { event: 'pause_toggle' }, payload => {
           updateIsPaused(payload.payload.isPaused);
         })
-        .on('broadcast', { event: 'player_sold' }, payload => {
+        .on('broadcast', { event: 'player_sold' }, () => {
           if (!isAdmin) updateIsSold(true);
         })
         .subscribe((status: string) => {
