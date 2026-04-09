@@ -59,7 +59,7 @@ const Auction = () => {
     const me = tms.find((t: any) => t.user_id === myUserId);
     if (me) setMyTeam(me);
     setSquads(sRes.data || []);
-    return { bids: bRes.data || [], teams: tms };
+    return { bids: bRes.data || [], teams: tms, squads: sRes.data || [] };
   };
 
   const fetchRoom = async () => {
@@ -109,6 +109,8 @@ const Auction = () => {
       if (freshTeam) {
         await supabase.from('teams').update({ purse: freshTeam.purse - top.amount }).eq('id', top.team_id);
       }
+      setSold(true);
+      channelRef.current?.send({ type: 'broadcast', event: 'sold', payload: { sold: true } });
     } else {
       // Unsold — broadcast so all clients know
       setSold(true);
@@ -145,8 +147,14 @@ const Auction = () => {
       if (!rm) return;
 
       // 2. Load all data
-      const { bids: initialBids } = await fetchAll(rm.id);
+      const { bids: initialBids, squads: initialSquads } = await fetchAll(rm.id);
       prevBidCount.current = initialBids.filter((b: any) => b.player_id === rm.current_player_index).length;
+
+      // Check if already sold (for page refreshes)
+      if (initialSquads.some((s: any) => s.player_id === rm.current_player_index)) {
+        setSold(true);
+        setTimeLeft(0);
+      }
 
       // 3. Single channel for BOTH send and receive
       channelRef.current = supabase.channel(`room_${roomId}_v2`);
